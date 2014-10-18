@@ -533,6 +533,49 @@ trait TypedPipe[+T] extends Serializable {
       flowDef.addTrap(pipe, trapSink.createTap(Write)(mode))
       TypedPipe.from[U](pipe, fields)(flowDef, mode, conv)
     })
+
+  def cumulativeSum[S](f: T => S)(implicit ordS: Ordering[S]): TypedPipe[((K,T), V)] = {
+
+    val sumPerS = p
+      .map { case ((k,t),v) => (k, f(t)) -> v}
+      .sumByKey
+      .map {case ((k,s), v) => (k, (s, v))}
+      .group
+      .sortBy { case (s,v) => s}
+      .scanLeft(None: Option[(Option[V], V, S)]) { case (acc, (s, v)) =>
+        acc match {
+          case Some((previousPreviousSum, previousSum, previousS)) => {
+            Some((Some(previousSum), sg.plus(v, previousSum), s))
+          }
+          case _ => Some((None, v, s))
+        }
+      }
+      .flatMap{ case(k, maybeAcc) =>
+        for(
+          acc <- maybeAcc;
+          previousSum <- acc._1
+        )
+        yield {(k,acc._3) -> (None, previousSum)}
+      }
+
+      (
+        p.map { case ((k,t),v) => (k, f(t)) -> (Some(t) ,v)} ++
+          sumPerS
+      )
+        .group
+        .sortBy { case (t,_) => t}
+        .scanLeft(None: Option[(Option[T], V)]) { case (acc, (maybeT, v)) =>
+          acc match {
+            case Some((_, previousSum)) => Some((maybeT, sg.plus(v, previousSum)))
+            case _ => Some((maybeT, v))
+          }
+        }
+        .flatMap { case ((k,s), acc) =>
+          for (tv <- acc; t <- tv._1) yield {
+            ((k,t), tv._2)
+          }
+        }
+  }
 }
 
 final case object EmptyTypedPipe extends TypedPipe[Nothing] {
