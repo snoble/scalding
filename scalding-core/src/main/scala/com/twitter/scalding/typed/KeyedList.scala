@@ -301,4 +301,47 @@ trait KeyedListLike[K, +T, +This[K, +T] <: KeyedListLike[K, T, This]]
   def keys: TypedPipe[K] = toTypedPipe.keys
   /** Convert to a TypedPipe and only keep the values */
   def values: TypedPipe[T] = toTypedPipe.values
+
+  def cumulativeSum[S, U, V](f: U => S)(implicit ev: T <:< (U,V), ordS: Ordering[S], sg: Semigroup[V], ordU: Ordering[U], ordK: Ordering[K]): Grouped[K, (U, V)] = {
+
+    val sumPerS = toTypedPipe
+      .map { case (k, (u: U,v: V)) => (k, f(u)) -> v}
+      .sumByKey
+      .map {case ((k,s), v) => (k, (s, v))}
+      .group
+      .sortBy { case (s,v) => s}
+      .scanLeft(None: Option[(Option[V], V, S)]) { case (acc, (s, v)) =>
+        acc match {
+          case Some((previousPreviousSum, previousSum, previousS)) => {
+            Some((Some(previousSum), sg.plus(v, previousSum), s))
+          }
+          case _ => Some((None, v, s))
+        }
+      }
+      .flatMap{ case(k, maybeAcc) =>
+        for(
+             acc <- maybeAcc;
+             previousSum <- acc._1
+        ) yield {(k,acc._3) -> (None, previousSum)}
+      }
+
+      (
+        toTypedPipe.map { case (k, (u: U, v: V)) => (k, f(u)) -> (Some(u) ,v)} ++
+          sumPerS
+      )
+        .group
+        .sortBy { case (u,_) => u}
+        .scanLeft(None: Option[(Option[U], V)]) { case (acc, (maybeU, v)) =>
+          acc match {
+            case Some((_, previousSum)) => Some((maybeU, sg.plus(v, previousSum)))
+            case _ => Some((maybeU, v))
+          }
+        }
+        .flatMap { case ((k,s), acc) =>
+          for (uv <- acc; u <- uv._1) yield {
+            (k, (u, uv._2))
+          }
+        }
+        .group
+      }
 }
