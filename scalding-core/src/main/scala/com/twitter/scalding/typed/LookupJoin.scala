@@ -136,10 +136,11 @@ object LookupJoin extends Serializable {
       left, right, reducers)(gate, { _.cumulativeSum(reducers.getOrElse(-1), partition) })
   }
 
-  private def gatedRightSumFactory[T: Ordering, JoinedV: Semigroup](gate: (T, T) => Boolean): Semigroup[(T, T, JoinedV)] = {
+  // This appears to produce a semigroup forall gate: (T,T) => Boolean, but not proven in the general case
+  private def gatedRightSumFactory[T, JoinedV: Semigroup](gate: (T, T) => Boolean): Semigroup[(T, T, JoinedV)] = {
     Semigroup.from {
       case ((leftMinT, leftMaxT, leftV), (rightMinT, rightMaxT, rightV)) => if (gate(leftMaxT, rightMinT)) {
-        (List(leftMinT, rightMinT).min, List(leftMaxT, rightMaxT).max, Semigroup.plus(leftV, rightV))
+        (leftMinT, rightMaxT, Semigroup.plus(leftV, rightV))
       } else {
         (rightMinT, rightMaxT, rightV)
       }
