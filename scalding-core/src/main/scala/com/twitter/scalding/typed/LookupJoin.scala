@@ -118,44 +118,68 @@ object LookupJoin extends Serializable {
   def withWindowRightSumming[T: Ordering, K: Ordering, V, JoinedV: Semigroup](left: TypedPipe[(T, (K, V))],
     right: TypedPipe[(T, (K, JoinedV))],
     reducers: Option[Int] = None)(gate: (T, T) => Boolean): TypedPipe[(T, (K, (V, Option[JoinedV])))] = {
+
+    implicit val gatedRightSum: Semigroup[(T, T, JoinedV)] = gatedRightSumFactory(gate)
     withWindowRightSummingAndOptionalPartition(
       left, right, reducers)(gate, { _.cumulativeSum(reducers.getOrElse(-1)) })
   }
 
-  def withWindowRightSummingAndPartition[T: Ordering, S: Ordering, K: Ordering, V, JoinedV: Semigroup](left: TypedPipe[(T, (K, V))],
+  def withWindowRightSummingAndPartitioning[T: Ordering, S: Ordering, K: Ordering, V, JoinedV: Semigroup](
+    left: TypedPipe[(T, (K, V))],
     right: TypedPipe[(T, (K, JoinedV))],
     reducers: Option[Int] = None)(
       gate: (T, T) => Boolean, partition: T => S): TypedPipe[(T, (K, (V, Option[JoinedV])))] = {
+
+    // This implicit semigroup is used by the cumulativeSum because the pipe is transformed by withWindowRightSummingAndOptionalPartition
+    implicit val gatedRightSum: Semigroup[(T, T, JoinedV)] = gatedRightSumFactory(gate)
     withWindowRightSummingAndOptionalPartition(
       left, right, reducers)(gate, { _.cumulativeSum(reducers.getOrElse(-1), partition) })
   }
 
-  private def withWindowRightSummingAndOptionalPartition[T: Ordering, K: Ordering, V, JoinedV: Semigroup](left: TypedPipe[(T, (K, V))],
+  private def gatedRightSumFactory[T: Ordering, JoinedV: Semigroup](gate: (T, T) => Boolean): Semigroup[(T, T, JoinedV)] = {
+    Semigroup.from {
+      case ((leftMinT, leftMaxT, leftV), (rightMinT, rightMaxT, rightV)) => if (gate(leftMaxT, rightMinT)) {
+        (List(leftMinT, rightMinT).min, List(leftMaxT, rightMaxT).max, Semigroup.plus(leftV, rightV))
+      } else {
+        (rightMinT, rightMaxT, rightV)
+      }
+    }
+  }
+
+  private def withWindowRightSummingAndOptionalPartition[T: Ordering, K: Ordering, V, JoinedV: Semigroup](
+    left: TypedPipe[(T, (K, V))],
     right: TypedPipe[(T, (K, JoinedV))],
     reducers: Option[Int] = None)(
       gate: (T, T) => Boolean,
-      cumulate: (TypedPipe[(K, (T, (Last[Option[V]], Option[(Last[T], JoinedV)])))]) => TypedPipe[(K, (T, (Last[Option[V]], Option[(Last[T], JoinedV)])))]): TypedPipe[(T, (K, (V, Option[JoinedV])))] = {
-    implicit val gatedRightSum: Semigroup[(T, JoinedV)] = Semigroup.from {
-      case ((leftT, leftV), (rightT, rightV)) => if (gate(leftT, rightT)) {
-        (rightT, Semigroup.plus(leftV, rightV))
-      } else {
-        (rightT, rightV)
-      }
-    }
+      cumulate:
+        TypedPipe[(K, (T, (Last[Option[V]], Option[(T, T, JoinedV)])))] =>
+        TypedPipe[(K, (T, (Last[Option[V]], Option[(T, T, JoinedV)])))]
+    ): TypedPipe[(T, (K, (V, Option[JoinedV])))] = {
 
-    val concatinated: TypedPipe[(K, (T, (Last[Option[V]], Option[(Last[T], JoinedV)])))] =
-      left.map { case (t, (k, v)) => (k, (t, (Last(Option(v)), None: Option[(Last[T], JoinedV)]))) }
+    /**
+     * We cumulate over the semigroup (Last[Option[V]], Option[(T, T, JoinedV)])
+     * Last[Option[V]] because we want to keep that last left side,
+     * even when the left side is None because in this case the right side
+     * is a right side update. These cases will be dropped by the collect.
+     *
+     * Option[(T, T, JoinedV)] because we need to be able to track of the left hand
+     * rows that occur before the first right hand side.
+     */
+
+    val concatinated: TypedPipe[(K, (T, (Last[Option[V]], Option[(T, T, JoinedV)])))] =
+      left.map { case (t, (k, v)) => (k, (t, (Last(Option(v)), None: Option[(T, T, JoinedV)]))) }
         .++(right.map {
           case (t, (k, joinedV)) =>
-            (k, (t, (Last(None: Option[V]), Option((Last(t), joinedV)))))
+            (k, (t, (Last(None: Option[V]), Option(t, t, joinedV))))
         })
 
     val cumulativeSummed = cumulate(concatinated)
     cumulativeSummed
       .collect {
-        case (k, (t, (Last(Some(v)), joinedTV))) =>
-          val joinedV = joinedTV.collect { case (joinedT, joinedV) if gate(joinedT.get, t) => joinedV }
-          (t, (k, (v, joinedV)))
+        case (k, (t, (Last(Some(v)), joinedTTV))) =>
+          val joinedV: Option[JoinedV] = joinedTTV.collect { case (_, joinedMaxT, joinedV) if gate(joinedMaxT, t) => joinedV }
+          val result: (T, (K, (V, Option[JoinedV]))) = (t, (k, (v, joinedV)))
+          result
       }
   }
 }
