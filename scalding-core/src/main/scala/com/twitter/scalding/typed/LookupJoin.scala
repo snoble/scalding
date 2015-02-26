@@ -136,13 +136,19 @@ object LookupJoin extends Serializable {
       left, right, reducers)(gate, { _.cumulativeSum(reducers.getOrElse(-1), partition) })
   }
 
-  // This appears to produce a semigroup forall gate: (T,T) => Boolean, but not proven in the general case
-  private def gatedRightSumFactory[T, JoinedV: Semigroup](gate: (T, T) => Boolean): Semigroup[(T, T, JoinedV)] = {
+  /**
+   * This appears to produce a semigroup forall gate: (T,T) => Boolean
+   * if an element has no defined minT that means all elements to the left of it
+   * will be ignored. If a sum encounters a !gate(leftMaxT, rightMinT) then
+   * minT is defined as fall and all further left hand additions will be ignored
+   * I have a love hate relationship with this semigroup
+   */
+  private def gatedRightSumFactory[T, JoinedV: Semigroup](gate: (T, T) => Boolean): Semigroup[(Option[T], T, JoinedV)] = {
     Semigroup.from {
-      case ((leftMinT, leftMaxT, leftV), (rightMinT, rightMaxT, rightV)) => if (gate(leftMaxT, rightMinT)) {
+      case ((leftMinT, leftMaxT, leftV), (Some(rightMinT), rightMaxT, rightV)) => if (gate(leftMaxT, rightMinT)) {
         (leftMinT, rightMaxT, Semigroup.plus(leftV, rightV))
       } else {
-        (rightMinT, rightMaxT, rightV)
+        (None, rightMaxT, rightV)
       }
     }
   }
