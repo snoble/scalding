@@ -18,7 +18,9 @@ package com.twitter.scalding.typed
 
 import java.io.Serializable
 
+import com.twitter.scalding.typed.CumulativeSum._
 import com.twitter.algebird.Semigroup
+import com.twitter.algebird.Last
 
 /*
  Copyright 2013 Twitter, Inc.
@@ -116,88 +118,90 @@ object LookupJoin extends Serializable {
   def withWindowRightSumming[T: Ordering, K: Ordering, V, JoinedV: Semigroup](left: TypedPipe[(T, (K, V))],
     right: TypedPipe[(T, (K, JoinedV))],
     reducers: Option[Int] = None)(gate: (T, T) => Boolean): TypedPipe[(T, (K, (V, Option[JoinedV])))] = {
-    /**
-     * Implicit ordering on an either that doesn't care about the
-     * actual container values, puts the lookups before the service writes
-     * Since we assume it takes non-zero time to do a lookup.
-     */
-    implicit def eitherOrd[T, U]: Ordering[Either[T, U]] =
-      new Ordering[Either[T, U]] {
-        def compare(l: Either[T, U], r: Either[T, U]) =
-          (l, r) match {
-            case (Left(_), Right(_)) => -1
-            case (Right(_), Left(_)) => 1
-            case (Left(_), Left(_)) => 0
-            case (Right(_), Right(_)) => 0
-          }
-      }
 
-    val joined: TypedPipe[(K, (Option[(T, JoinedV)], Option[(T, V, Option[JoinedV])]))] =
-      left.map { case (t, (k, v)) => (k, (t, Left(v): Either[V, JoinedV])) }
+    implicit val gatedRightSum: Semigroup[(T, T, JoinedV)] = gatedRightSumFactory(gate)
+    withWindowRightSummingAndOptionalPartition(
+      left, right, reducers)(gate, { _.cumulativeSum(reducers.getOrElse(-1)) })
+  }
+
+  def withWindowRightSummingAndPartitioning[T: Ordering, S: Ordering, K: Ordering, V, JoinedV: Semigroup](
+    left: TypedPipe[(T, (K, V))],
+    right: TypedPipe[(T, (K, JoinedV))],
+    reducers: Option[Int] = None)(
+      gate: (T, T) => Boolean, partition: T => S): TypedPipe[(T, (K, (V, Option[JoinedV])))] = {
+
+    // This implicit semigroup is used by the cumulativeSum because the pipe is transformed by withWindowRightSummingAndOptionalPartition
+    implicit val gatedRightSum: Semigroup[(T, T, JoinedV)] = gatedRightSumFactory(gate)
+    withWindowRightSummingAndOptionalPartition(
+      left, right, reducers)(gate, { _.cumulativeSum(reducers.getOrElse(-1), partition) })
+  }
+
+  /**
+   * Proof that this is a semigroup forall gate: (T,T) => Boolean
+   * We're going to say gate of ((Option[T], T, X), (Option[T], T, X))
+   * is just gate of the leftMaxT and the rightMinT (And is false if 
+   * rightMinT is not defined)
+   *
+   * It's not hard to see that
+   * gate(a+b, c) = gate(b,c)
+   * and
+   * gate(a, b+c) = gate(b,c) & gate(a,b)
+   *
+   * So now for every + apply the appropriate gate multiplier to the left hand side,
+   * where the multiplier is 1 for true and 0 for false (any semigroup can be extended to a group)
+   * a + (b + c) = gate(a,b+c)*a + (b + c) = (gate(b,c) & gate(a,b))*a + (b + c)
+   *             = (gate(b,c) & gate(a,b))*a + (gate(b,c)*b + c)
+   * (a + b) + c = gate(a+b, c)*(a + b) + c = gate(b,c)*(a + b) + c
+   *             = gate(b,c)*(gate(a,b)*a + b) + c
+   *             = (gate(b,c)&gate(a,b)*a + gate(b,c)b) + c
+   * Now with the gates applied we are simply adding the values of JoinedV
+   * which we know to be associative
+   */
+  private def gatedRightSumFactory[T, JoinedV: Semigroup](gate: (T, T) => Boolean): Semigroup[(Option[T], T, JoinedV)] = {
+    def gate(l: T, r: Option[T]) = {r.map { gate(l, _)}.getOrElse(false)}
+    Semigroup.from { case ((leftMinT, leftMaxT, leftV), (rightMinT, rightMaxT, rightV)) =>
+      if (gate(leftMaxT, rightMinT)) {
+        (leftMinT, rightMaxT, Semigroup.plus(leftV, rightV))
+      } else {
+        (None, rightMaxT, rightV)
+      }
+    }
+  }
+
+  private def withWindowRightSummingAndOptionalPartition[T: Ordering, K: Ordering, V, JoinedV: Semigroup](
+    left: TypedPipe[(T, (K, V))],
+    right: TypedPipe[(T, (K, JoinedV))],
+    reducers: Option[Int] = None)(
+      gate: (T, T) => Boolean,
+      cumulate:
+        TypedPipe[(K, (T, (Last[Option[V]], Option[(T, T, JoinedV)])))] =>
+        TypedPipe[(K, (T, (Last[Option[V]], Option[(T, T, JoinedV)])))]
+    ): TypedPipe[(T, (K, (V, Option[JoinedV])))] = {
+
+    /**
+     * We cumulate over the semigroup (Last[Option[V]], Option[(T, T, JoinedV)])
+     * Last[Option[V]] because we want to keep that last left side,
+     * even when the left side is None because in this case the right side
+     * is a right side update. These cases will be dropped by the collect.
+     *
+     * Option[(T, T, JoinedV)] because we need to be able to track of the left hand
+     * rows that occur before the first right hand side.
+     */
+
+    val concatinated: TypedPipe[(K, (T, (Last[Option[V]], Option[(T, T, JoinedV)])))] =
+      left.map { case (t, (k, v)) => (k, (t, (Last(Option(v)), None: Option[(T, T, JoinedV)]))) }
         .++(right.map {
           case (t, (k, joinedV)) =>
-            (k, (t, Right(joinedV): Either[V, JoinedV]))
+            (k, (t, (Last(None: Option[V]), Option(t, t, joinedV))))
         })
-        .group
-        .withReducers(reducers.getOrElse(-1)) // -1 means default in scalding
-        .sorted
-        /**
-         * Grouping by K leaves values of (T, Either[V, JoinedV]). Sort
-         * by time and scanLeft. The iterator will now represent pairs of
-         * T and either new values to join against or updates to the
-         * simulated "realtime store" described above.
-         */
-        .scanLeft(
-          /**
-           * In the simulated realtime store described above, this
-           * None is the value in the store at the current
-           * time. Because we sort by time and scan forward, this
-           * value will be updated with a new value every time a
-           * Right(delta) shows up in the iterator.
-           *
-           * The second entry in the pair will be None when the
-           * JoinedV is updated and Some(newValue) when a (K, V)
-           * shows up and a new join occurs.
-           */
-          (Option.empty[(T, JoinedV)], Option.empty[(T, V, Option[JoinedV])])) {
-            case ((None, result), (time, Left(v))) => {
-              // The was no value previously
-              (None, Some((time, v, None)))
-            }
 
-            case ((prev @ Some((oldt, jv)), result), (time, Left(v))) => {
-              // Left(v) means that we have a new value from the left
-              // pipe that we need to join against the current
-              // "lastJoined" value sitting in scanLeft's state. This
-              // is equivalent to a lookup on the data in the right
-              // pipe at time "thisTime".
-              val filteredJoined = if (gate(time, oldt)) Some(jv) else None
-              (prev, Some((time, v, filteredJoined)))
-            }
-
-            case ((None, result), (time, Right(joined))) => {
-              // There was no value before, so we just update to joined
-              (Some((time, joined)), None)
-            }
-
-            case ((Some((oldt, oldJ)), result), (time, Right(joined))) => {
-              // Right(joinedV) means that we've received a new value
-              // to use in the simulated realtime service
-              // described in the comments above
-              // did it fall out of cache?
-              val nextJoined = if (gate(time, oldt)) Semigroup.plus(oldJ, joined) else joined
-              (Some((time, nextJoined)), None)
-            }
-          }.toTypedPipe
-
-    // Now, get rid of residual state from the scanLeft above:
-    joined.flatMap {
-      case (k, (_, optV)) =>
-        // filter out every event that produced a Right(delta) above,
-        // leaving only the leftJoin events that occurred above:
-        optV.map {
-          case (t, v, optJoined) => (t, (k, (v, optJoined)))
-        }
-    }
+    val cumulativeSummed = cumulate(concatinated)
+    cumulativeSummed
+      .collect {
+        case (k, (t, (Last(Some(v)), joinedTTV))) =>
+          val joinedV: Option[JoinedV] = joinedTTV.collect { case (_, joinedMaxT, joinedV) if gate(joinedMaxT, t) => joinedV }
+          val result: (T, (K, (V, Option[JoinedV]))) = (t, (k, (v, joinedV)))
+          result
+      }
   }
 }
