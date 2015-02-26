@@ -137,15 +137,30 @@ object LookupJoin extends Serializable {
   }
 
   /**
-   * This appears to produce a semigroup forall gate: (T,T) => Boolean
-   * if an element has no defined minT that means all elements to the left of it
-   * will be ignored. If a sum encounters a !gate(leftMaxT, rightMinT) then
-   * minT is defined as fall and all further left hand additions will be ignored
-   * I have a love hate relationship with this semigroup
+   * Proof that this is a semigroup forall gate: (T,T) => Boolean
+   * We're going to say gate of ((Option[T], T, X), (Option[T], T, X))
+   * is just gate of the leftMaxT and the rightMinT (And is false if 
+   * rightMinT is not defined)
+   *
+   * It's not hard to see that
+   * gate(a+b, c) = gate(b,c)
+   * and
+   * gate(a, b+c) = gate(b,c) & gate(a,b)
+   *
+   * So now for every + apply the appropriate gate multiplier to the left hand side,
+   * where the multiplier is 1 for true and 0 for false (any semigroup can be extended to a group)
+   * a + (b + c) = gate(a,b+c)*a + (b + c) = (gate(b,c) & gate(a,b))*a + (b + c)
+   *             = (gate(b,c) & gate(a,b))*a + (gate(b,c)*b + c)
+   * (a + b) + c = gate(a+b, c)*(a + b) + c = gate(b,c)*(a + b) + c
+   *             = gate(b,c)*(gate(a,b)*a + b) + c
+   *             = (gate(b,c)&gate(a,b)*a + gate(b,c)b) + c
+   * Now with the gates applied we are simply adding the values of JoinedV
+   * which we know to be associative
    */
   private def gatedRightSumFactory[T, JoinedV: Semigroup](gate: (T, T) => Boolean): Semigroup[(Option[T], T, JoinedV)] = {
-    Semigroup.from {
-      case ((leftMinT, leftMaxT, leftV), (Some(rightMinT), rightMaxT, rightV)) => if (gate(leftMaxT, rightMinT)) {
+    def gate(l: T, r: Option[T]) = {r.map { gate(l, _)}.getOrElse(false)}
+    Semigroup.from { case ((leftMinT, leftMaxT, leftV), (rightMinT, rightMaxT, rightV)) =>
+      if (gate(leftMaxT, rightMinT)) {
         (leftMinT, rightMaxT, Semigroup.plus(leftV, rightV))
       } else {
         (None, rightMaxT, rightV)
